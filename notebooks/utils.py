@@ -2,6 +2,11 @@ import rasterio
 import matplotlib.pyplot as plt
 import numpy as np
 
+import rasterio
+import matplotlib.pyplot as plt
+import numpy as np
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
 def visualize_sentinel_tiles(filepaths, titles=None):
     """
     Visualize multiple Sentinel-2 GeoTIFF files with proper RGB rendering 
@@ -45,11 +50,6 @@ def visualize_sentinel_tiles(filepaths, titles=None):
     plt.tight_layout()
     return fig, axes
 
-
-import rasterio
-import matplotlib.pyplot as plt
-import numpy as np
-from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 def visualize_sentinel_tile(filepath, colormap='viridis'):
     """
