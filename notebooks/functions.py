@@ -10,13 +10,15 @@ import numpy as np
 def geo_to_h3(lat, lng, h3_res=5):
   return h3.latlng_to_cell(lat=lat,lng=lng, res=h3_res)
 
-
 def group_by_h3_cell(df, h3_col='h3_index', species_col='species'):
     geo_df = gpd.GeoDataFrame(data=None, columns=['geometry', h3_col, 'count', species_col])
     
-    # Group by h3_cell and aggregate
+    # Group by h3_cell and aggregate - ensure flat lists
     grouped = df.groupby(h3_col).agg({
-        species_col: ['nunique', lambda x: list(x)]  # Use list(x) instead of just list
+        species_col: [
+            'nunique', 
+            lambda x: x.tolist()  # This creates a flat list directly
+        ]
     }).reset_index()
 
     # Flatten the MultiIndex columns
@@ -24,9 +26,9 @@ def group_by_h3_cell(df, h3_col='h3_index', species_col='species'):
 
     print(grouped['species_count'].sum())
 
-    # Ensure all items in species_list are strings and flatten if needed
+    # Convert all items to strings and ensure flat list
     grouped['species_list'] = grouped['species_list'].apply(
-        lambda x: [str(item) for item in (x if isinstance(x, list) else [x])]
+        lambda x: [str(item) for item in (x if isinstance(x, (list, np.ndarray)) else [x])]
     )
 
     # Merge the geometry back into the grouped DataFrame
@@ -35,10 +37,11 @@ def group_by_h3_cell(df, h3_col='h3_index', species_col='species'):
     # Merge the grouped DataFrame back into the geo_df
     geo_df = pd.concat([geo_df, grouped], ignore_index=True)
 
-    # Group by h3_cell and combine species lists
+    # Final aggregation - flatten all species lists and get unique values
     geo_df = geo_df.groupby(h3_col).agg({
-        'species_list': lambda x: list(set(item for sublist in x for item in sublist)), 
+        'species_list': lambda x: list(set(item for sublist in x for item in sublist))
     }).reset_index()
+    
     geo_df['species_count'] = geo_df['species_list'].apply(len)
     
     return geo_df
@@ -71,8 +74,8 @@ def extract_raster_values_for_h3(geometry, raster_path):
         out_image, out_transform = mask(src, [geometry_proj], crop=True)
         return out_image[0], src.transform
 
-def add_geometry(row):
-  points = h3.cell_to_boundary(row['h3_cell'])
+def add_geometry(row, col_name='h3_cell'):
+  points = h3.cell_to_boundary(row[col_name])
   flipped = tuple(coord[::-1] for coord in points)
   return Polygon(flipped)
 
