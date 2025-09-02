@@ -119,10 +119,10 @@ def get_train_val_indices(processed_species_df, grid_config, validation_patch_nu
     df_copy = processed_species_df.copy()
 
     # Ensure expanded_cells are valid geometry objects
-    if not hasattr(df_copy['expanded_cells'].iloc[0], 'geom_type'):
-        df_copy['expanded_cells'] = df_copy['expanded_cells'].apply(wkt_loads)
+    if not hasattr(df_copy['geometry'].iloc[0], 'geom_type'):
+        df_copy['geometry'] = df_copy['geometry'].apply(wkt_loads)
 
-    gdf = gpd.GeoDataFrame(df_copy, geometry='expanded_cells')
+    gdf = gpd.GeoDataFrame(df_copy, geometry='geometry')
 
     # Store original index
     original_index_name = gdf.index.name if gdf.index.name is not None else 'original_index'

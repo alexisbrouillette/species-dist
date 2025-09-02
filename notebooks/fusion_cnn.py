@@ -34,6 +34,68 @@ import numpy as np
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
 import math
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+import torch
+import torch.nn as nn
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from torchgeo.models import ResNet50_Weights
+from torchgeo.models import resnet50
+
+class AsymmetricLoss(nn.Module):
+    """ Asymmetric Loss for imbalanced binary classification
+    Based on Ridnik et al., 2021.
+    Implements:
+    - asymmetric focusing (gamma_pos, gamma_neg)
+    - optional asymmetric clipping for negatives
+    - detached modulation for stability
+    """
+    def __init__(self, gamma_pos=0.0, gamma_neg=2.0, clip=0.0, eps=1e-8, pos_weight=None):
+        super().__init__()
+        self.gamma_pos = float(gamma_pos)
+        self.gamma_neg = float(gamma_neg)
+        self.clip = float(clip)
+        self.eps = eps
+        # pos_weight is optional and generally should be small or None with ASL
+        self.pos_weight = None
+        if pos_weight is not None:
+            # allow float or 1D tensor
+            self.pos_weight = torch.as_tensor(pos_weight, dtype=torch.float32)
+
+    def forward(self, logits, targets):
+        # shapes: (N, 1) or (N,) → flatten
+        logits = logits.view(-1)
+        targets = targets.view(-1).float()
+        # probabilities
+        xs_pos = torch.sigmoid(logits)
+        xs_neg = 1.0 - xs_pos
+        # asymmetric clipping for negatives (optional)
+        if self.clip > 0.0:
+            # paper-style: add then clamp
+            xs_neg = torch.clamp(xs_neg + self.clip, max=1.0)
+        # log-likelihoods
+        log_pos = torch.log(xs_pos.clamp(min=self.eps))
+        log_neg = torch.log(xs_neg.clamp(min=self.eps))
+        # base loss (no modulation yet)
+        loss = targets * log_pos + (1.0 - targets) * log_neg
+        # asymmetric focusing (detach the prob used for the modulating factor)
+        with torch.no_grad():
+            pt = targets * xs_pos + (1.0 - targets) * xs_neg  # prob of the true class
+            gamma = targets * self.gamma_pos + (1.0 - targets) * self.gamma_neg
+            mod_factor = (1.0 - pt).pow(gamma)
+        loss = loss * mod_factor  # apply modulation
+        # optional positive weighting (use sparingly with ASL)
+        if self.pos_weight is not None:
+            w = targets * self.pos_weight + (1.0 - targets)
+            loss = loss * w
+        return -loss.mean()
+
 class FocalLoss(nn.Module):
     """Focal Loss for handling class imbalance"""
     def __init__(self, alpha=1.0, gamma=2.0, pos_weight=None):
@@ -50,11 +112,9 @@ class FocalLoss(nn.Module):
             )
         else:
             BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
-        
         pt = torch.exp(-BCE_loss)
         focal_loss = self.alpha * (1 - pt) ** self.gamma * BCE_loss
         return focal_loss.mean()
-
 
 class AttentionPooling(nn.Module):
     """Attention-based pooling instead of max/average pooling"""
@@ -74,7 +134,6 @@ class AttentionPooling(nn.Module):
         # Global weighted average pooling
         return weighted.sum(dim=[2, 3]) / (weights.sum(dim=[2, 3]) + 1e-8)
 
-
 class SpatialFourierFeatures(nn.Module):
     """Encode spatial coordinates using Fourier features"""
     def __init__(self, num_features=32):
@@ -82,7 +141,7 @@ class SpatialFourierFeatures(nn.Module):
         self.num_features = num_features
         # Create random frequencies for Fourier encoding
         self.register_buffer('frequencies', torch.randn(num_features // 2, 2) * 10)
-    
+
     def forward(self, coords):
         # coords: (batch_size, 2) - [lat, lon] normalized to [-1, 1]
         # Apply Fourier transform
@@ -93,119 +152,211 @@ class SpatialFourierFeatures(nn.Module):
         ], dim=-1)  # (batch_size, num_features)
         return fourier_features
 
+class SpatialPyramidPooling(nn.Module):
+    """Spatial Pyramid Pooling layer that handles variable input sizes"""
+    def __init__(self, pool_sizes=[1, 2, 4]):
+        super().__init__()
+        self.pool_sizes = pool_sizes
+
+    def forward(self, x):
+        batch_size, channels, h, w = x.size()
+        pooled_features = []
+        for pool_size in self.pool_sizes:
+            pooled = F.adaptive_avg_pool2d(x, (pool_size, pool_size))
+            pooled = pooled.view(batch_size, -1)
+            pooled_features.append(pooled)
+        return torch.cat(pooled_features, dim=1)
+
+class FlexibleCNNBranch(nn.Module):
+    """CNN branch that handles variable input sizes with multiple pooling options"""
+    def __init__(self, in_channels, config):
+        super().__init__()
+        # Get dropout rate
+        dropout_rate = config.get('dropout', 0.3)
+        # Progressive channel expansion
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Dropout2d(dropout_rate * 0.5)  # Lower dropout in early layers
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Dropout2d(dropout_rate * 0.7)
+        )
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Dropout2d(dropout_rate)
+        )
+        # Optional deeper layers for better feature extraction
+        self.use_deeper = config.get('use_deeper_cnn', False)
+        if self.use_deeper:
+            self.conv4 = nn.Sequential(
+                nn.Conv2d(128, 256, kernel_size=3, padding=1),
+                nn.BatchNorm2d(256),
+                nn.ReLU(inplace=True),
+                nn.MaxPool2d(2),
+                nn.Dropout2d(dropout_rate)
+            )
+            final_channels = 256
+        else:
+            final_channels = 128
+        # Pooling strategy
+        self.use_attention = config.get('use_attention', False)
+        self.use_spp = config.get('use_spp', True)  # Default to SPP
+        if self.use_attention:
+            self.attention_pool = AttentionPooling(final_channels)
+            self.output_size = final_channels
+        elif self.use_spp:
+            pool_sizes = config.get('spp_pool_sizes', [1, 2, 4])
+            self.spp = SpatialPyramidPooling(pool_sizes)
+            self.output_size = final_channels * sum(size * size for size in pool_sizes)
+        else:
+            # Fallback to adaptive pooling + flatten
+            self.adaptive_pool = nn.AdaptiveAvgPool2d((4, 4))  # Fixed output size
+            self.output_size = final_channels * 16
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        if self.use_deeper:
+            x = self.conv4(x)
+        # Apply appropriate pooling
+        if self.use_attention:
+            x = self.attention_pool(x)
+        elif self.use_spp:
+            x = self.spp(x)
+        else:
+            x = self.adaptive_pool(x)
+            x = x.view(x.size(0), -1)
+        return x
+
+class TabularFeatureEncoder(nn.Module):
+    """Simple MLP to encode tabular features"""
+    def __init__(self, input_dim, hidden_dims=[32, 64, 128], dropout=0.3):
+        super().__init__()
+        if not isinstance(input_dim, int):
+            raise ValueError(f"Expected integer input_dim, got {input_dim}")
+        print(f"TabularFeatureEncoder input_dim: {input_dim}")
+        layers = []
+        current_dim = input_dim
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(current_dim, hidden_dim))
+            layers.append(nn.BatchNorm1d(hidden_dim))
+            layers.append(nn.ReLU(inplace=True))
+            layers.append(nn.Dropout(dropout))
+            current_dim = hidden_dim
+        self.encoder = nn.Sequential(*layers)
+        self.output_size = current_dim
+
+    def forward(self, x):
+        if x.dim() != 2:
+            raise ValueError(f"Expected 2D input tensor, got shape {x.shape}")
+        return self.encoder(x)
 
 class SimpleMultiInputCNNv2(nn.Module):
     def __init__(self, input_shapes, config):
-        """
-        input_shapes: list of tuples, e.g. [(67,100,100), (9,256,256)]
+        """ input_shapes: list of tuples, e.g. [(67,100,100), (9,256,256)]
         config: dict with configuration parameters
         """
         super().__init__()
         self.config = config
         self.branches = nn.ModuleList()
         self.flatten_sizes = []
-        
         # Build CNN branches
-        for i, (c, h, w) in enumerate(input_shapes):
-            layers = []
-
-            # First conv block
-            layers.extend([
-                nn.Conv2d(c, 16, kernel_size=3, padding=1),
-                nn.BatchNorm2d(16),
-                nn.ReLU(),
-                nn.MaxPool2d(2)  # keep regular pooling here
-            ])
-
-            # Second conv block
-            layers.extend([
-                nn.Conv2d(16, 32, kernel_size=3, padding=1),
-                nn.BatchNorm2d(32),
-                nn.ReLU(),
-                nn.MaxPool2d(2)  # regular pooling
-            ])
-
-            # Optional third conv block
-            if config.get('use_deeper_cnn', False):
-                layers.extend([
-                    nn.Conv2d(32, 64, kernel_size=3, padding=1),
-                    nn.BatchNorm2d(64),
-                    nn.ReLU(),
-                    nn.MaxPool2d(2)
-                ])
-
-            # **Apply attention pooling at the end instead of flattening**
-            if config.get('use_attention', False):
-                final_channels = 64 if config.get('use_deeper_cnn', False) else 32
-                layers.append(AttentionPooling(final_channels))
+        for i, dict in enumerate(input_shapes):
+            shape = dict['shape']
+            source = dict['source']
+            print(f"Building branch {i} for source '{source}' with shape {shape}")
+            if source == 'point_infos':  # Tabular branch
+                input_dim = shape[0]  # not (c, n)!
+                branch = TabularFeatureEncoder(
+                    input_dim,
+                    config.get('tabular_hidden_dims', [32, 64, 32]),
+                    config.get('dropout', 0.3)
+                )
             else:
-                layers.append(nn.Flatten())  # If no attention, flatten as usual
-
-            branch = nn.Sequential(*layers)
-            self.branches.append(branch)
-
-            # Compute flatten size dynamically
-            with torch.no_grad():
-                dummy = torch.zeros(1, c, h, w)
-                flat_size = branch(dummy)
-                if config.get('use_attention', False):
-                    flat_size = flat_size.shape[1]  # AttentionPooling outputs [batch, channels]
+                if source == 'sentinel2':
+                    print("Using TorchGeo pretrained ResNet50 for Sentinel-2 branch")
+                    weights = ResNet50_Weights.SENTINEL2_MI_MS_SATLAS  # or SENTINEL2_MI_MS_SATLAS
+                    model = resnet50(weights=weights)
+                    model.fc = nn.Identity()          # remove classifier
+                    branch = model
+                    branch.output_size = 2048
                 else:
-                    flat_size = flat_size.shape[1]
-                self.flatten_sizes.append(flat_size)
-
+                    (c, h, w) = shape
+                    branch = FlexibleCNNBranch(c, config)
+            self.branches.append(branch)
+            self.flatten_sizes.append(branch.output_size)
+        # Use the known output size
         total_flatten = sum(self.flatten_sizes)
-        
         # Add spatial features if enabled
         spatial_features = 0
         if config.get('use_spatial_features', False):
             spatial_features = config.get('spatial_feature_dim', 32)
             self.spatial_encoder = SpatialFourierFeatures(spatial_features)
-        
-        # Fully connected layers
-        fc_layers = []
-        input_dim = total_flatten + spatial_features
-        
-        # Hidden layers
-        hidden_dims = config.get('hidden_dims', [256])
-        for hidden_dim in hidden_dims:
-            fc_layers.extend([
-                nn.Linear(input_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(config.get('dropout', 0.3))
-            ])
-            input_dim = hidden_dim
-        
+        self.build_classifier(total_flatten + spatial_features, config)
+
+    def build_classifier(self, input_dim, config):
+        """Build classifier with optional residual connections"""
+        hidden_dims = config.get('hidden_dims', [512, 256, 128])
+        dropout_rate = config.get('dropout', 0.3)
+        use_residual = config.get('use_residual', True)
+        layers = []
+        current_dim = input_dim
+        for i, hidden_dim in enumerate(hidden_dims):
+            layers.append(nn.Linear(current_dim, hidden_dim))
+            layers.append(nn.BatchNorm1d(hidden_dim))
+            layers.append(nn.ReLU(inplace=True))
+            layers.append(nn.Dropout(dropout_rate))
+            current_dim = hidden_dim
         # Output layer
-        fc_layers.append(nn.Linear(input_dim, 1))  # Single species for now
-        
-        self.fc = nn.Sequential(*fc_layers)
+        layers.append(nn.Linear(current_dim, 1))
+        self.classifier = nn.Sequential(*layers)
+        # For class imbalance - you might want to use this in your loss function
+        self.class_weights = config.get('class_weights', None)
 
     def forward(self, inputs, coords=None):
         # inputs: list of tensors, one per branch
         features = [branch(x) for branch, x in zip(self.branches, inputs)]
         merged = torch.cat(features, dim=1)
-        
         # Add spatial features if enabled
         if self.config.get('use_spatial_features', False) and coords is not None:
             spatial_features = self.spatial_encoder(coords)
             merged = torch.cat([merged, spatial_features], dim=1)
-        
-        out = self.fc(merged)
+        out = self.classifier(merged)
         return out  # raw logits
 
-    def get_loss_function(self):
+    def get_loss_function(self, device=None):
         """Get the appropriate loss function based on configuration"""
-        if self.config.get('use_focal_loss', False):
+        pos_weight = torch.tensor(
+            [self.config.get('pos_weight', 2.5)],
+            dtype=torch.float32,
+            device=device if device is not None else "cpu"
+        )
+        if self.config.get('use_asymmetric_loss', False):
+            return AsymmetricLoss(
+                gamma_pos=self.config.get('asl_gamma_pos', 0),
+                gamma_neg=self.config.get('asl_gamma_neg', 1),
+                clip=self.config.get('asl_clip', 0.0),
+                pos_weight=pos_weight
+            )
+        elif self.config.get('use_focal_loss', False):
             return FocalLoss(
-                alpha=self.config.get('focal_alpha', 1.0),
+                alpha=self.config.get('focal_alpha', 0.5),
                 gamma=self.config.get('focal_gamma', 2.0),
-                pos_weight=torch.tensor([self.config.get('pos_weight', 2.5)])
+                pos_weight=pos_weight
             )
         else:
-            pos_weight = self.config.get('pos_weight', 2.5)
-            return nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight]))
-
+            return nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
 def calculate_metrics(y_true, y_pred, y_prob):
     """Calculate comprehensive metrics"""
@@ -320,17 +471,17 @@ def training_loop(model, training_dataset, validation_dataset, config):
     train_loader = DataLoader(training_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
     val_loader = DataLoader(validation_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
     
-    # Model setup
-    model = model.to(device)
-    if config.get('compile_model', True):
-        try:
-            model = torch.compile(model, mode="default")
-            print("Model compiled successfully")
-        except:
-            print("Model compilation failed, using uncompiled model")
+    # # Model setup
+    # model = model.to(device)
+    # if config.get('compile_model', True):
+    #     try:
+    #         model = torch.compile(model, mode="default")
+    #         print("Model compiled successfully")
+    #     except:
+    #         print("Model compilation failed, using uncompiled model")
     
     # Loss and optimizer
-    criterion = model.get_loss_function().to(device)
+    criterion = model.get_loss_function(device=device)
     
     optimizer_type = config.get('optimizer', 'adam')
     if optimizer_type == 'adam':
@@ -343,7 +494,7 @@ def training_loop(model, training_dataset, validation_dataset, config):
     # Scheduler
     if config.get('use_scheduler', True):
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=4, min_lr=1e-6
+            optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6
         )
     
     # Metrics tracking
@@ -382,8 +533,8 @@ def training_loop(model, training_dataset, validation_dataset, config):
         # Print progress
         if (epoch + 1) % config.get('print_every', 2) == 0:
             print(f"Epoch [{epoch+1}/{epochs}]:")
-            print(f"  Train - Accuracy: {train_metrics['accuracy']:.4f}, Loss: {train_metrics['loss']:.4f}, F1: {train_metrics['f1']:.4f}, AUC: {train_metrics['roc_auc']:.4f}")
-            print(f"  Val   - Accuracy: {val_metrics['accuracy']:.4f}, Loss: {val_metrics['loss']:.4f}, F1: {val_metrics['f1']:.4f}, AUC: {val_metrics['roc_auc']:.4f}")
+            print(f"  Train - Accuracy: {train_metrics['accuracy']:.4f}, Loss: {train_metrics['loss']:.4f}, F1: {train_metrics['f1']:.4f}, AUC: {train_metrics['roc_auc']:.4f}, Precision: {train_metrics['precision']:.4f}, Recall: {train_metrics['recall']:.4f}")
+            print(f"  Val   - Accuracy: {val_metrics['accuracy']:.4f}, Loss: {val_metrics['loss']:.4f}, F1: {val_metrics['f1']:.4f}, AUC: {val_metrics['roc_auc']:.4f}, Precision: {val_metrics['precision']:.4f}, Recall: {val_metrics['recall']:.4f}")
             print(f"  LR: {optimizer.param_groups[0]['lr']:.6f}")
     
     results = {
@@ -397,155 +548,6 @@ def training_loop(model, training_dataset, validation_dataset, config):
     
     return model, results
 
-
-# Example usage and testing scenarios
-def run_experiments(input_shapes, training_dataset, validation_dataset):
-    """Run multiple experiments with different configurations"""
-    
-    scenarios = [
-        {
-            'name': 'Baseline (Max Pooling + BCE)',
-            'use_attention': False,
-            'use_focal_loss': False,
-            'use_spatial_features': False,
-            'use_deeper_cnn': False,
-        },
-        {
-            'name': 'Attention Pooling Only',
-            'use_attention': True,
-            'use_focal_loss': False,
-            'use_spatial_features': False,
-            'use_deeper_cnn': False,
-        },
-        {
-            'name': 'Focal Loss Only',
-            'use_attention': False,
-            'use_focal_loss': True,
-            'focal_alpha': 1.0,
-            'focal_gamma': 2.0,
-            'use_spatial_features': False,
-            'use_deeper_cnn': False,
-        },
-        {
-            'name': 'Attention + Focal Loss',
-            'use_attention': True,
-            'use_focal_loss': True,
-            'focal_alpha': 1.0,
-            'focal_gamma': 2.0,
-            'use_spatial_features': False,
-            'use_deeper_cnn': False,
-        },
-        {
-            'name': 'Attention + Focal + Spatial Features',
-            'use_attention': True,
-            'use_focal_loss': True,
-            'focal_alpha': 1.0,
-            'focal_gamma': 2.0,
-            'use_spatial_features': True,
-            'spatial_feature_dim': 32,
-            'use_deeper_cnn': False,
-        },
-        {
-            'name': 'Full Configuration',
-            'use_attention': True,
-            'use_focal_loss': True,
-            'focal_alpha': 1.0,
-            'focal_gamma': 2.0,
-            'use_spatial_features': True,
-            'spatial_feature_dim': 32,
-            'use_deeper_cnn': True,
-            'hidden_dims': [512, 256],
-            'dropout': 0.4,
-            'optimizer': 'adamw',
-            'weight_decay': 1e-4,
-            'gradient_clipping': True,
-            'max_grad_norm': 1.0,
-        }
-    ]
-    
-    results = {}
-    
-    for scenario in scenarios:
-        print(f"\n{'='*60}")
-        print(f"Running: {scenario['name']}")
-        print(f"{'='*60}")
-        
-        # Create model with current configuration
-        model = SimpleMultiInputCNNv2(input_shapes, scenario[0])
-        
-        # Train model
-        trained_model, training_results = training_loop(
-            model, training_dataset, validation_dataset, scenario
-        )
-        
-        # Store results
-        results[scenario['name']] = {
-            'config': scenario,
-            'results': training_results,
-            'model': trained_model
-        }
-        
-        print(f"\nFinal Results for {scenario['name']}:")
-        print(f"  Best Val Loss: {training_results['best_val_loss']:.4f}")
-        print(f"  Best Val F1: {training_results['best_val_f1']:.4f}")
-        print(f"  Final Val AUC: {training_results['final_val_metrics']['roc_auc']:.4f}")
-    
-    return results
-
-# ----- Multi-input CNN -----
-class SimpleMultiInputCNN(nn.Module):
-    def __init__(self, input_shapes):
-        """
-        input_shapes: list of tuples, e.g. [(67,100,100), (9,256,256)]
-        """
-        super().__init__()
-        self.branches = nn.ModuleList()
-        self.flatten_sizes = []
-
-        for c, h, w in input_shapes:
-            layers = nn.Sequential(
-                nn.Conv2d(c, 16, kernel_size=3, padding=1),
-                nn.BatchNorm2d(16),
-                nn.ReLU(),
-                nn.MaxPool2d(2),
-                nn.Conv2d(16, 32, kernel_size=3, padding=1),
-                nn.BatchNorm2d(32),
-                nn.ReLU(),
-                nn.MaxPool2d(2),
-                nn.Flatten()
-            )
-            self.branches.append(layers)
-
-            # Compute flatten size dynamically
-            with torch.no_grad():
-                dummy = torch.zeros(1, c, h, w)
-                flat_size = layers(dummy).shape[1]
-                self.flatten_sizes.append(flat_size)
-
-        total_flatten = sum(self.flatten_sizes)
-        self.fc = nn.Sequential(
-            nn.Linear(total_flatten, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, 1)  # Output logits for BCEWithLogitsLoss
-        )
-
-    def forward(self, inputs):
-        # inputs: list of tensors, one per branch
-        features = [branch(x) for branch, x in zip(self.branches, inputs)]
-        merged = torch.cat(features, dim=1)
-        out = self.fc(merged)
-        return out  # raw logits
-
-# ----------------------
-# Loss selector
-# ----------------------
-
-def get_loss(config):
-    if config.get("use_focal_loss", False):
-        return FocalLoss()
-    else:
-        return nn.BCEWithLogitsLoss()
 
 ##################################################
 ################Data loading######################
@@ -624,121 +626,6 @@ class RandomFlipRotate:
         x = torch.rot90(x, k, dims=[1, 2])
         return x
     
-
-
-class MultiSourceNpyDataset(Dataset):
-    def __init__(self, npy_files, targets, features_index=None, indices=None, transform=None):
-        self.npy_files = npy_files
-        self.targets = targets
-        self.features_index = features_index
-        self.indices = np.arange(len(targets)) if indices is None else indices
-        self.transform = transform
-
-        # --- MODIFIED: Load shapes from metadata files ---
-        self.shapes = []
-        if len(self.npy_files) == 0:
-            raise ValueError("You must provide at least one .npy file.")
-        else:
-            for npy_file in self.npy_files:
-                try:
-                    patches, shape = load_patches(npy_file, as_float=False, mmap_mode='r')
-                    self.shapes.append(shape)
-                except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
-                    raise ValueError(f"Could not load shape from metadata file {npy_file.replace('.npy', '_metadata.json')}: {e}")
-
-        # --- ORIGINAL LOGIC REMAINS THE SAME ---
-        self.data_arrays = []
-        for f, shape in zip(self.npy_files, self.shapes):
-            # The 'dtype' needs to be handled correctly as the original is uint8
-            arr = np.memmap(f, dtype=np.uint8, mode="r", shape=shape)
-            self.data_arrays.append(arr)
-
-        # compute effective shapes (after channel selection)
-        self.effective_shapes = []
-        for i, shape in enumerate(self.shapes):
-            c, h, w = shape[1:]  # skip batch dim
-            if i == 0 and self.features_index is not None:
-                c = len(self.features_index)
-            self.effective_shapes.append((c, h, w))
-
-    def __len__(self):
-        return len(self.indices)
-
-    def __getitem__(self, idx):
-        idx = self.indices[idx]
-        data_items = []
-        for i, arr in enumerate(self.data_arrays):
-            patch = arr[idx]
-            # Convert from uint8 [0, 255] to float32 [0, 1] on the fly
-            patch = patch.astype(np.float32) / 255.0
-            if i == 0 and self.features_index is not None:
-                patch = patch[self.features_index]
-            # Convert to TensorFlow tensor instead of PyTorch
-            #patch_tensor = tf.convert_to_tensor(patch, dtype=tf.float32)
-            patch_tensor = torch.tensor(patch, dtype=torch.float32)
-            data_items.append(patch_tensor)
-        #target_tensor = tf.convert_to_tensor(self.targets[idx], dtype=tf.float32)
-        # --- Apply transform once (across all modalities if needed) ---
-        if self.transform:
-            data_items = [self.transform(x) for x in data_items]
-
-        target_tensor = torch.tensor(self.targets[idx], dtype=torch.float32)
-        return tuple(data_items) + (target_tensor,)
-
-    # The to_tf_dataset and KerasSequenceWrapper classes remain the same
-    # as the core data loading logic in __getitem__ is now handled.
-    def to_tf_dataset(self, batch_size=32, shuffle=False, prefetch=tf.data.AUTOTUNE):
-        """
-        Convert to tf.data.Dataset for use with TensorFlow/Keras
-        """
-        def generator():
-            indices = self.indices.copy()
-            if shuffle:
-                np.random.shuffle(indices)
-            
-            for idx in indices:
-                data_items = []
-                for i, arr in enumerate(self.data_arrays):
-                    patch = arr[idx]
-                    # Convert from uint8 [0, 255] to float32 [0, 1]
-                    patch_float = patch.astype(np.float32) / 255.0
-                    if i == 0 and self.features_index is not None:
-                        patch_float = patch_float[self.features_index]
-                    data_items.append(patch_float)
-                
-                target = self.targets[idx].astype(np.float32)
-                yield tuple(data_items), target
-
-        # Determine output signature
-        output_types = []
-        output_shapes = []
-        
-        # For data items
-        for shape in self.effective_shapes:
-            output_types.append(tf.float32)
-            output_shapes.append(tf.TensorShape(shape))
-        
-        # For targets
-        target_shape = tf.TensorShape(self.targets[0].shape) if hasattr(self.targets[0], 'shape') else tf.TensorShape([])
-        
-        dataset = tf.data.Dataset.from_generator(
-            generator,
-            output_signature=(
-                tuple(tf.TensorSpec(shape=shape, dtype=tf.float32) for shape in output_shapes),
-                tf.TensorSpec(shape=target_shape, dtype=tf.float32)
-            )
-        )
-        
-        if batch_size:
-            dataset = dataset.batch(batch_size)
-        
-        if prefetch:
-            dataset = dataset.prefetch(prefetch)
-        
-        # Set cardinality to help with progress bar
-        dataset = dataset.apply(tf.data.experimental.assert_cardinality(len(self) // batch_size if batch_size else len(self)))
-            
-        return dataset
     
 def extract_coordinates_from_locations(processed_species_original_locations, indices):
     """
@@ -770,12 +657,17 @@ def extract_coordinates_from_locations(processed_species_original_locations, ind
     return torch.tensor(coords, dtype=torch.float32)
 
 
+import torch
+import numpy as np
+
 class MultiSourceNpyDatasetWithCoords:
     """
-    Enhanced dataset class that includes coordinate support
+    Enhanced dataset class that includes coordinate support,
+    with optional cropping of patches to a smaller ratio.
     """
     def __init__(self, npy_files, targets, processed_species_original_locations, 
-                 features_index=None, indices=None, transform=None, include_coords=False):
+                 features_index=None, indices=None, transform=None, 
+                 include_coords=False, resize_ratio=1.0, add_point_infos=False):
         self.npy_files = npy_files
         self.targets = targets
         self.features_index = features_index
@@ -783,42 +675,70 @@ class MultiSourceNpyDatasetWithCoords:
         self.transform = transform
         self.include_coords = include_coords
         self.processed_species_original_locations = processed_species_original_locations
+        self.resize_ratio = resize_ratio
+        self.add_point_infos = add_point_infos
+        self.pred100_index = None  # To be set if needed
+        if self.targets.dtype != np.float32:
+            self.targets = self.targets.astype(np.float32)
 
-        # Load shapes from metadata files (keeping your original logic)
+        # Load shapes
         self.shapes = []
         if len(self.npy_files) == 0:
             raise ValueError("You must provide at least one .npy file.")
         else:
             for npy_file in self.npy_files:
                 try:
-                    # Assuming you have this function from your original code
-                    patches, shape = load_patches(npy_file, as_float=False, mmap_mode='r')
+                    path = npy_file['path']
+                    print(f"Loading shape from: {path}")
+                    patches, shape = load_patches(path, as_float=False, mmap_mode='r')
                     self.shapes.append(shape)
                 except (FileNotFoundError, Exception) as e:
-                    print(f"Warning: Could not load shape from metadata file {npy_file}: {e}")
-                    # Fallback: try to load a small portion to infer shape
-                    try:
-                        arr = np.load(npy_file, mmap_mode='r')
-                        self.shapes.append(arr.shape)
-                        print(f"Inferred shape from direct loading: {arr.shape}")
-                    except Exception as e2:
-                        raise ValueError(f"Could not load or infer shape for {npy_file}: {e2}")
+                    print(f"Warning: Could not load shape from metadata file {path}: {e}")
+                    arr = np.load(path, mmap_mode='r')
+                    self.shapes.append(arr.shape)
 
-        # Load data arrays
+        # Load arrays as memmap
         self.data_arrays = []
         for f, shape in zip(self.npy_files, self.shapes):
-            arr = np.memmap(f, dtype=np.uint8, mode="r", shape=shape)
+            path = f['path']
+            arr = np.memmap(path, dtype=np.uint8, mode="r", shape=shape)
             self.data_arrays.append(arr)
 
-        # Compute effective shapes (after channel selection)
+        # Compute effective shapes (account for feature subset and crop ratio)
         self.effective_shapes = []
         for i, shape in enumerate(self.shapes):
-            c, h, w = shape[1:]  # skip batch dim
-            if i == 0 and self.features_index is not None:
+            c, h, w = shape[1:]  # (N, C, H, W)
+            if npy_files[i]['name'] == 'pred100':
                 c = len(self.features_index)
-            self.effective_shapes.append((c, h, w))
+                self.pred100_index = i
 
-        # Extract coordinates if needed
+            if self.resize_ratio < 1.0:
+                h = int(h * self.resize_ratio)
+                w = int(w * self.resize_ratio)
+
+            self.effective_shapes.append({
+                "shape": (c, h, w),
+                "source": npy_files[i]['name']
+                })
+        if self.add_point_infos:
+            point_infos = processed_species_original_locations.drop(columns=['geometry', 'species_list']).values
+            point_infos = point_infos.astype(np.float32)
+
+            # Select specific columns if features_index is provided
+            if self.features_index is not None:
+                # Ensure features_index is a list or array
+                if isinstance(self.features_index, int):
+                    self.features_index = [self.features_index]
+                point_infos = point_infos[:, self.features_index]
+
+            self.point_infos = point_infos
+            print(f"Extracted point infos shape: {self.point_infos.shape}")
+            self.effective_shapes.append({
+                "shape": (self.point_infos.shape[1],),
+                "source": "point_infos"
+                })  # single-element tuple
+
+        # Coordinates if needed
         if self.include_coords:
             self.coordinates = extract_coordinates_from_locations(
                 processed_species_original_locations, self.indices
@@ -828,29 +748,44 @@ class MultiSourceNpyDatasetWithCoords:
     def __len__(self):
         return len(self.indices)
 
+    def _center_crop(self, patch, new_h, new_w):
+        _, h, w = patch.shape
+        top = (h - new_h) // 2
+        left = (w - new_w) // 2
+        return patch[:, top:top+new_h, left:left+new_w]
+
     def __getitem__(self, idx):
-        actual_idx = self.indices[idx]
         data_items = []
-        
+
         for i, arr in enumerate(self.data_arrays):
-            patch = arr[actual_idx]  # shape should already be (C, H, W) for this branch
-            # Convert from uint8 [0, 255] to float32 [0, 1]
-            patch = patch.astype(np.float32) / 255.0
+            patch = arr[self.indices[idx]].astype(np.float32)  # (C, H, W)
 
-            # If selecting a subset of features for the first array
-            if i == 0 and self.features_index is not None:
-                patch = patch[self.features_index]  # still (C', H, W)
+            # Select subset of features for first array if needed
+            if i == self.pred100_index and self.features_index is not None:
+                patch = patch[self.features_index]
 
-            patch_tensor = torch.tensor(patch, dtype=torch.float32)  # (C, H, W)
-            data_items.append(patch_tensor)
+                patch = patch/ 255.0
 
-        # Apply transform (e.g., augmentations)
+            # Apply center crop if ratio < 1.0
+            if self.resize_ratio < 1.0:
+                _, h, w = patch.shape
+                new_h, new_w = int(h * self.resize_ratio), int(w * self.resize_ratio)
+                patch = self._center_crop(patch, new_h, new_w)
+
+            tensor = torch.from_numpy(patch)
+            data_items.append(tensor)
+
+        # Transform (augmentations etc.)
         if self.transform:
             data_items = [self.transform(x) for x in data_items]
+        # Add point infos if needed
+        if self.add_point_infos:
+            point_info = self.point_infos[idx]
+            point_info_tensor = torch.from_numpy(point_info)
+            data_items.append(point_info_tensor)
 
-        target_tensor = torch.tensor(self.targets[actual_idx], dtype=torch.float32)
+        target_tensor = torch.from_numpy(self.targets[idx])
 
-        # Return with or without coordinates
         if self.include_coords:
             coords = self.coordinates[idx]
             return data_items, target_tensor, coords
