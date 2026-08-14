@@ -129,7 +129,7 @@ def compute_scale_from_disk(species: str) -> dict:
         "otsu_percentile": round(otsu_percentile, 2),
         "mean_raw": round(mean_raw, 5),
         "mean_percentile": round(mean_percentile, 2),
-        "_algo_version": 8,      # bump to invalidate stale cache entries
+        "_algo_version": 12,      # bump to invalidate stale cache entries
     }
 
 
@@ -170,9 +170,7 @@ def _resolve_threshold(scale: dict, percentile) -> float:
 
     s_min = scale['min_prob']
     s_max = scale['max_prob']
-    MIN_MAX_SUITABILITY = 0.50
-    scale_max = max(s_max, MIN_MAX_SUITABILITY)
-    span = scale_max - s_min if scale_max - s_min > 0 else 0.0001
+    span = (s_max - s_min) if (s_max - s_min) > 1e-5 else 0.0001
     return float(np.clip((raw_threshold - s_min) / span, 0.0, 1.0))
 
 
@@ -340,17 +338,13 @@ def render_merged_tile(species, map_z, map_x, map_y, vmin=0.0, vmax=1.0, percent
     # ── 4. Rescale to [0, 1] range, apply percentile-based threshold, and map to custom LUT ──
     with config._scale_cache_lock:
         cached = config._scale_cache.get(species)
-        if cached is None or cached.get('_algo_version', 0) < 8:
+        if cached is None or cached.get('_algo_version', 0) < 12:
             config._scale_cache[species] = compute_scale_from_disk(species)
         scale = config._scale_cache[species]
         s_min = scale['min_prob']
         s_max = scale['max_prob']
 
-    # Clamping scale max to prevent stretching negligible probabilities
-    MIN_MAX_SUITABILITY = 0.50
-    scale_max = max(s_max, MIN_MAX_SUITABILITY)
-    span = scale_max - s_min if scale_max - s_min > 0 else 0.0001
-    
+    span = (s_max - s_min) if (s_max - s_min) > 1e-5 else 0.0001
     grid_clean = np.where(valid, grid, 0.0)
     rescaled = np.clip((grid_clean - s_min) / span, 0.0, 1.0)
 
@@ -360,15 +354,10 @@ def render_merged_tile(species, map_z, map_x, map_y, vmin=0.0, vmax=1.0, percent
     threshold = _resolve_threshold(scale, percentile)
     under_threshold = valid & (rescaled < threshold)
 
-    if raw_pixels:
-        # Continuous RAW probability mapping (0.0 to 1.0)
-        norm = np.nan_to_num(np.clip(rescaled, 0.0, 1.0), nan=0.0)
-        palette = config.RAW_CONTINUOUS_COLORS
-    else:
-        # Discrete isoline contour step mapping
-        t_span = max(1.0 - threshold, 1e-4)
-        norm = np.nan_to_num(np.clip((rescaled - threshold) / t_span, 0.0, 1.0), nan=0.0)
-        palette = config.DISCRETE_COLORS
+    # Re-scale color gradient from threshold to 1.0 for the chosen threshold method
+    t_span = max(1.0 - threshold, 1e-4)
+    norm = np.nan_to_num(np.clip((rescaled - threshold) / t_span, 0.0, 1.0), nan=0.0)
+    palette = config.RAW_CONTINUOUS_COLORS if raw_pixels else config.DISCRETE_COLORS
 
     num_steps = len(palette) - 1
     color_idx = np.clip(np.rint(norm * num_steps), 0, num_steps).astype(np.int32)
@@ -468,7 +457,7 @@ def save_global_map_at_res(species: str, grid_n: int, suffix: str):
         if np.any(inside):
             fc = np.clip((LON[inside] - ext['minlon']) /
                          (ext['maxlon'] - ext['minlon']) * (nc - 1), 0, nc - 1)
-            fr = np.clip((LAT[inside] - ext['minlat']) /
+            fr = np.clip((ext['maxlat'] - LAT[inside]) /
                          (ext['maxlat'] - ext['minlat']) * (nr - 1), 0, nr - 1)
             c0 = np.floor(fc).astype(int); c1 = np.minimum(c0 + 1, nc - 1)
             r0 = np.floor(fr).astype(int); r1 = np.minimum(r0 + 1, nr - 1)
@@ -519,20 +508,15 @@ def save_global_map_at_res(species: str, grid_n: int, suffix: str):
     s_min = scale['min_prob']
     s_max = scale['max_prob']
     
-    # Clamping scale max to prevent stretching negligible probabilities
-    MIN_MAX_SUITABILITY = 0.50
-    scale_max = max(s_max, MIN_MAX_SUITABILITY)
-    span = scale_max - s_min if scale_max - s_min > 0 else 0.0001
-
+    span = (s_max - s_min) if (s_max - s_min) > 1e-5 else 0.0001
     grid_clean = np.where(valid, grid, 0.0)
-    rescaled_linear = np.clip((grid_clean - s_min) / span, 0.0, 1.0)
-    rescaled = rescaled_linear
+    rescaled = np.clip((grid_clean - s_min) / span, 0.0, 1.0)
     
     # No opacity fading (always 100% opaque for active pixels)
     opacity_factor = 1.0
 
-    # Static maps default to 98th-percentile masking for a clean look
-    threshold = _resolve_threshold(scale, 98)
+    # Static maps default to Otsu masking for a clean look
+    threshold = _resolve_threshold(scale, 'otsu')
     under_threshold = valid & (rescaled < threshold)
 
     t_span = max(1.0 - threshold, 1e-4)

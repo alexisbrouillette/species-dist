@@ -1,5 +1,5 @@
 const API = window.location.port === '5500' ? 'http://localhost:8090' : window.location.origin;
-const FULLMAP_GRID_N = 100;   // must match main.py FULLMAP_GRID_N
+const FULLMAP_GRID_N = 500;   // must match config.py FULLMAP_GRID_N
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let sdmLayer       = null;

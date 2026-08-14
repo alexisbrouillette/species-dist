@@ -65,7 +65,7 @@ def run_inference(species: str, tx: int, ty: int):
 
 
 def run_inference_stats_only(species: str, tx: int, ty: int):
-    torch.set_num_threads(2)
+    torch.set_num_threads(6)
 
     slug = species.lower().replace(" ", "_")
     cp   = config.CACHE_DIR / slug / str(tx) / f"{ty}.npy"
@@ -493,7 +493,7 @@ def _run_fullmap_stats_only(species: str):
     out_dir.mkdir(parents=True, exist_ok=True)
     fm_path = out_dir / config.FULLMAP_NPY
 
-    grid_n = 250
+    grid_n = config.FULLMAP_GRID_N
     ext = config.STATS_EXTENT
     
     lons = np.linspace(ext['minlon'], ext['maxlon'], grid_n)
