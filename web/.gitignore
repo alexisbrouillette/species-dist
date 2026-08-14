@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+tile_cache_v2/
+tile_cache/
+*.png
+*.tif
+*.npy
+*.pkl
+*.pt

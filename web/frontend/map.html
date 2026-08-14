@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SDM Explorer</title>
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700;900&family=Space+Mono:wght@400;700&display=swap">
+  <link rel="stylesheet" href="style.css?v=2">
+
+</head>
+<body>
+
+<!-- Full-bleed map -->
+<div id="map"></div>
+
+<!-- ── Species details card (floating, middle-left) ──────────────────────── -->
+<div id="species-card" class="species-card-collapsed" hidden>
+  <button id="species-card-toggle" title="Toggle species info" aria-label="Toggle species info">◀</button>
+  <div class="species-card-content">
+    <div class="species-img-container">
+      <img id="species-img" src="" alt="" hidden>
+      <div id="species-img-placeholder" class="species-img-placeholder">
+        <span class="placeholder-icon">🍃</span>
+      </div>
+      <div class="species-card-badge">Flora</div>
+    </div>
+    <div class="species-card-body">
+      <h3 id="species-card-title"></h3>
+      <h4 id="species-card-common"></h4>
+      <p id="species-card-desc"></p>
+      <div id="species-card-meta" class="species-card-meta"></div>
+      <div id="species-card-cohort" class="species-card-cohort" style="display: none;">
+        <h5>Niche Associate Cohort</h5>
+        <div id="species-card-cohort-list" class="cohort-list"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Command palette (floating, top-center) ─────────────────────────────── -->
+<div id="cmd">
+
+  <!-- Search row — always visible -->
+  <div id="cmd-bar">
+    <span id="cmd-dot"></span>
+    <input id="cmd-input" type="text"
+           autocomplete="off" spellcheck="false"
+           placeholder="Search or add a species…">
+    <button id="cmd-clear" title="Clear" aria-label="Clear">✕</button>
+  </div>
+
+  <!-- Results dropdown — shown when input focused or has value -->
+  <div id="cmd-results" hidden>
+    <!-- Dropdown tabs for category filtering -->
+    <div id="cmd-tabs">
+      <button class="cmd-tab active" data-tab="all">🌿 All (<span id="count-all">0</span>)</button>
+      <button class="cmd-tab" data-tab="Trees & Plants">🌲 Plants (<span id="count-plants">0</span>)</button>
+      <button class="cmd-tab" data-tab="Birds">🐦 Birds (<span id="count-birds">0</span>)</button>
+      <button class="cmd-tab" data-tab="Insects">🪲 Insects (<span id="count-insects">0</span>)</button>
+      <button class="cmd-tab" data-tab="cached">⭐ Saved (<span id="count-cached">0</span>)</button>
+    </div>
+    <!-- Unified ranked list (cached + known + generate row) -->
+    <div id="cmd-list"></div>
+    <button id="btn-trigger-add" class="cmd-register-btn">+ Register New Species</button>
+  </div>
+</div>
+
+<!-- ── Active species pill + generate button (bottom-center) ──────────────── -->
+<div id="active-bar" hidden>
+  <div id="active-pill">
+    <span id="active-dot"></span>
+    <span id="active-name"></span>
+  </div>
+  <button id="generate-btn" disabled>⟳ Refine Viewport (High-Res)</button>
+  <button id="fullmap-btn" disabled title="Generate full suitability map">
+    <span id="fullmap-icon">◈</span>
+    <span id="fullmap-label">Generate Map</span>
+  </button>
+</div>
+
+<!-- ── Progress bar (bottom edge, full width) ─────────────────────────────── -->
+<div id="progress-track" hidden>
+  <div id="progress-fill"></div>
+  <span id="progress-text"></span>
+</div>
+
+<!-- ── Legend ─────────────────────────────────────────────────────────────── -->
+<div id="legend">
+  <div class="legend-title">Suitability</div>
+  <div class="grad"></div>
+  <div class="leg-row">
+    <span id="leg-min">0%</span>
+    <span id="leg-mid">50%</span>
+    <span id="leg-max">100%</span>
+  </div>
+</div>
+
+<!-- ── Threshold panel (bottom-right, above legend) ────────────────────── -->
+<div id="threshold-panel" hidden>
+  <div class="threshold-header">
+    <span class="threshold-label">Mask low habitat</span>
+    <span id="threshold-value-display" class="threshold-value"></span>
+  </div>
+  <div id="threshold-steps" role="group" aria-label="Threshold percentile">
+    <button class="threshold-step" data-percentile="null" id="thresh-none">Off</button>
+    <button class="threshold-step" data-percentile="adaptive" id="thresh-adaptive">Adaptive</button>
+    <button class="threshold-step active" data-percentile="otsu" id="thresh-otsu">Otsu</button>
+    <button class="threshold-step" data-percentile="mean" id="thresh-mean">Mean</button>
+  </div>
+</div>
+
+<!-- ── Layer & Theme toggles (top-right) ───────────────────────────────────── -->
+<div id="layer-toggles">
+  <button id="toggle-border" class="active" title="Toggle Quebec Territory Border">🗺️ Border</button>
+  <button id="toggle-render-mode" title="Toggle 1km Raw Pixels vs Smoothed Isolines">👾 1km Pixels</button>
+  <select id="theme-select" title="Switch Theme" aria-label="Switch Theme">
+    <option value="forest">🌲 Forest</option>
+    <option value="abyss">🌊 Abyss</option>
+    <option value="twilight">🌇 Twilight</option>
+    <option value="light">☀️ Light</option>
+  </select>
+  <button id="toggle-hillshade" title="Toggle hillshade relief">⛰ Relief</button>
+</div>
+
+<!-- ── Log ────────────────────────────────────────────────────────────────── -->
+<div id="log">
+  <div id="log-header">
+    <span>Console</span>
+    <span id="log-toggle">▼</span>
+  </div>
+  <div id="log-entries"><b>SDM</b> — ready<br></div>
+</div>
+
+
+<!-- ── Toast ──────────────────────────────────────────────────────────────── -->
+<div id="toast"></div>
+
+<!-- ── Centered Modal (New Species Registration) ──────────────────────────── -->
+<div id="add-species-overlay" class="modal-overlay" hidden>
+  <div class="modal-card">
+    <button class="modal-close" id="btn-modal-close" aria-label="Close">✕</button>
+    <h2 class="modal-title">Register Species</h2>
+    <h3 id="modal-species-name" class="modal-subtitle"></h3>
+    
+    <div class="modal-body">
+      <div class="modal-input-group">
+        <label class="drawer-label">Species Name</label>
+        <input id="new-name" type="text" placeholder="e.g. Acer rubrum" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="drawer-row">
+        <label class="drawer-label">Ecological Description <span class="drawer-optional">optional</span></label>
+        <button id="btn-gen-desc" class="drawer-link">↻ auto-generate</button>
+      </div>
+      <textarea id="new-desc" placeholder="Ecological description for the embedding. Leave blank to auto-generate."></textarea>
+      
+      <button id="btn-add" class="drawer-submit">Register &amp; generate map</button>
+      <div id="add-feedback"></div>
+    </div>
+  </div>
+</div>
+
+<script src="app.js?v=5"></script>
+</body>
+</html>
