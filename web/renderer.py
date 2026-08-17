@@ -129,7 +129,7 @@ def compute_scale_from_disk(species: str) -> dict:
         "otsu_percentile": round(otsu_percentile, 2),
         "mean_raw": round(mean_raw, 5),
         "mean_percentile": round(mean_percentile, 2),
-        "_algo_version": 14,      # bump to invalidate stale cache entries
+        "_algo_version": 18,      # bump to invalidate stale cache entries
     }
 
 

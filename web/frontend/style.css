@@ -89,7 +89,7 @@ body {
 }
 
 /* ── Map fills everything ─────────────────────────────────────────────────── */
-#map { width: 100vw; height: 100vh; }
+#map { width: 100vw; height: 100vh; background: #f8fafc; }
 
 /* ── Interactive transitions for all controls ─────────────────────────────── */
 button, input, textarea {

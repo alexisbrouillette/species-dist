@@ -122,13 +122,13 @@ def _build_continuous_palette(stops, n_levels=256):
     return palette
 
 COLOR_STOPS = [
-    [185, 212, 218, 255], # #b9d4da (soft pale blue)
-    [140, 192, 202, 255], # #8cc0ca (light teal)
-    [106, 172, 184, 255], # #6aacb8 (medium blue)
-    [30,  111, 126, 255], # #1e6f7e (dark blue/teal)
-    [10,  61,  74,  255], # #0a3d4a (very dark teal)
-    [255, 217, 125, 255], # #ffd97d (golden)
-    [232, 160, 32,  255]  # #e8a020 (dark gold)
+    [165, 220, 235, 255], # #a5dceb: Vibrant soft sky blue
+    [105, 195, 215, 255], # #69c3d7: Vibrant bright teal
+    [65,  165, 190, 255], # #41a5be: Vivid medium blue
+    [20,  120, 145, 255], # #147891: Rich dark cyan/teal
+    [8,   65,  85,  255], # #084155: Deep rich dark teal
+    [255, 215, 80,  255], # #ffd750: Vibrant golden yellow
+    [245, 155, 20,  255]  # #f59b14: Luminous, punchy electric gold peak
 ]
 
 DISCRETE_COLORS = _build_continuous_palette(COLOR_STOPS, n_levels=10)

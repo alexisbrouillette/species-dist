@@ -54,7 +54,7 @@ map.getPane('labelsPane').style.zIndex    = 400;  // all labels on top
 // without touching the SDM colour layer above it.
 map.getPane('hillshadePane').style.mixBlendMode = 'multiply';
 
-const baseLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png', {
+const baseLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}{r}.png', {
   pane: 'basePane', opacity: 1.0,
   attribution: '© OpenStreetMap contributors © CARTO',
 }).addTo(map);
@@ -65,9 +65,9 @@ const hillshadeLayer = L.tileLayer(
   { pane: 'hillshadePane', opacity: 0.45, attribution: 'Hillshade © Esri', maxZoom: 16 }
 );
 
-// CartoDB Dark Matter labels — city names, boundaries, on top of overlay
+// CartoDB Light Positron labels — city names, boundaries, on top of overlay
 const terrainLabelsLayer = L.tileLayer(
-  'https://{s}.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}{r}.png',
+  'https://{s}.basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}{r}.png',
   { pane: 'labelsPane', opacity: 0.9, attribution: '© OpenStreetMap contributors © CARTO', maxZoom: 20 }
 ).addTo(map);
 
@@ -89,7 +89,12 @@ function setHillshade(on) {
 }
 
 // ── Theme Manager ─────────────────────────────────────────────────────────────
-let currentTheme = localStorage.getItem('sdm-theme') || 'forest';
+let savedTheme = localStorage.getItem('sdm-theme');
+if (!savedTheme || savedTheme === 'forest' || savedTheme === 'abyss') {
+  savedTheme = 'light';
+  localStorage.setItem('sdm-theme', 'light');
+}
+let currentTheme = savedTheme;
 
 function applyTheme(theme) {
   currentTheme = theme;
