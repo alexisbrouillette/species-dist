@@ -365,7 +365,17 @@ def render_merged_tile(species, map_z, map_x, map_y, vmin=0.0, vmax=1.0, percent
     rgba8 = palette[color_idx].copy()
     rgba8[~valid, 3] = 0
     rgba8[under_threshold, 3] = 0
-    
+
+    # ── Hotspot Preservation & Golden Glow Halo (for low-zoom map_z <= 8) ────────
+    if map_z <= 8:
+        hotspot_mask = valid & ~under_threshold & (norm >= 0.75)
+        if hotspot_mask.any():
+            from scipy.ndimage import binary_dilation
+            # Dilate hotspot mask by 1 pixel so small peak hotspots remain vivid when zoomed out
+            glow_halo = binary_dilation(hotspot_mask, iterations=1) & ~hotspot_mask & valid
+            glow_color = np.array([255, 217, 125, 220], dtype=np.uint8)  # #ffd97d vibrant golden bloom
+            rgba8[glow_halo] = glow_color
+
     alpha_val = int(255 * opacity_factor)
     rgba8[valid & ~under_threshold, 3] = alpha_val
 
