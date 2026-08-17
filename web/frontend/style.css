@@ -1425,9 +1425,3 @@ html[data-theme="light"] .skeleton {
   background: rgba(255, 255, 255, 0.1);
   border-color: var(--text);
 }
-
-/* ── Low-Zoom Hotspot Golden Bloom Filter ──────────────────────────────────── */
-.leaflet-tile-pane {
-  filter: drop-shadow(0 0 1.5px rgba(255, 217, 125, 0.45));
-  transition: filter 0.3s ease-in-out;
-}

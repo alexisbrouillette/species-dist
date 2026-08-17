@@ -198,15 +198,21 @@ def run_inference_cnn(species: str, tx: int, ty: int):
         zarr_path = config.EMB_DIR / "context_map.zarr"
         mask_path = config.EMB_DIR / "valid_mask.npy"
         try:
-            if zip_path.exists():
-                from zarr.storage import ZipStore
-                _store = ZipStore(zip_path, mode='r')
-                store = zarr.open(store=_store, mode='r')
-            else:
+            if zarr_path.exists():
                 store = zarr.open(str(zarr_path), mode='r')
+            elif zip_path.exists():
+                print("📦 Auto-extracting context_map.zip into context_map.zarr...", flush=True)
+                import zipfile
+                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                    zip_ref.extractall(config.EMB_DIR.resolve())
+                store = zarr.open(str(zarr_path), mode='r')
+            else:
+                raise FileNotFoundError(f"Neither {zarr_path} nor {zip_path} exists")
             valid_mask = np.load(mask_path)
         except Exception as e:
-            print(f"❌ Error loading pre-computed data in run_inference: {e}")
+            print(f"❌ Error loading pre-computed data in run_inference: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
             return final_probs, False
 
         # ── Project species text embedding (768D → 128D) ───────────────────────────
@@ -529,27 +535,41 @@ def _run_fullmap_stats_only(species: str):
 
         if total_valid > 0:
             active_indices = flat_indices[valid_mask_250]
-            
-            # Load stats
-            stats_batch = model_manager.stats_mmap[active_indices].astype(np.float32)
-            stats_tensor = torch.from_numpy(stats_batch).to(config.DEVICE)
+            stats_batch_all = model_manager.stats_mmap[active_indices].astype(np.float32)
 
             with torch.no_grad():
                 stats_model = model_manager.stats_model
                 text_proj = F.normalize(stats_model.text_proj(target_emb), dim=-1)
-                
-                K = stats_tensor.shape[0]
-                batch_text = target_emb.unsqueeze(0).expand(K, -1, -1)
-                
-                visual_features = stats_model(stats=stats_tensor, text_embeds=batch_text)
-                v_norm = F.normalize(visual_features, dim=2)
-                
-                # Dot product similarity
-                sim = (v_norm.squeeze(1) * text_proj).sum(dim=-1)
-                
                 t_val = model_manager.stats_t_val
                 b_val = model_manager.stats_b_val
-                probs = torch.sigmoid(sim * t_val + b_val).cpu().numpy()
+
+                SUB_BATCH = 16384
+                all_probs = []
+                total_pts = len(stats_batch_all)
+
+                for j in range(0, total_pts, SUB_BATCH):
+                    chunk_stats = stats_batch_all[j : j + SUB_BATCH]
+                    stats_tensor = torch.from_numpy(chunk_stats).to(config.DEVICE)
+                    K = stats_tensor.shape[0]
+                    batch_text = target_emb.unsqueeze(0).expand(K, -1, -1)
+                    
+                    visual_features = stats_model(stats=stats_tensor, text_embeds=batch_text)
+                    v_norm = F.normalize(visual_features, dim=2)
+                    sim = (v_norm.squeeze(1) * text_proj).sum(dim=-1)
+                    
+                    chunk_probs = torch.sigmoid(sim * t_val + b_val).cpu().numpy()
+                    all_probs.append(chunk_probs)
+
+                    # Update progress for real-time frontend streaming
+                    done_count = min(j + K, total_pts)
+                    pct = round((done_count / total_pts) * 100.0, 1)
+                    with _fullmap_lock:
+                        _fullmap_progress[species] = {
+                            "status": "running", "done": done_count, "total": total_pts,
+                            "pct": pct, "min_prob": float(chunk_probs.min()), "max_prob": float(chunk_probs.max()),
+                        }
+
+                probs = np.concatenate(all_probs)
 
             valid_flat_pos = np.where(valid_mask_250)[0]
             full_grid_flat[valid_flat_pos] = probs

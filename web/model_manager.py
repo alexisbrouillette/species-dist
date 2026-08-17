@@ -135,9 +135,9 @@ if config.STATS_MODEL_PATH.exists() and config.STATS_INDEX_PATH.exists():
         
         # Load insects, birds, and trees v4 CSV files
         stats_files = [
-            (config.STATS_SPECIES_EMBEDDINGS, "Insects"),
-            (Path("../notebooks/species_embeddings_v4_birds.csv"), "Birds"),
-            (Path("../notebooks/species_embeddings_v4.csv"), "Trees & Plants")
+            (config.STATS_SPECIES_INSECTS, "Insects"),
+            (config.STATS_SPECIES_BIRDS, "Birds"),
+            (config.STATS_SPECIES_TREES, "Trees & Plants")
         ]
         
         all_stats_species = []
@@ -208,11 +208,7 @@ if config.STATS_MODEL_PATH.exists() and config.STATS_INDEX_PATH.exists():
         traceback.print_exc()
 
 def is_stats_species(species_name: str) -> bool:
-    # Use stats-only model by default for everything EXCEPT species that are ONLY in the old CNN model
-    name_clean = species_name.lower().strip()
-    old_cnn_species_set = set(sp.lower().strip() for sp in _INITIAL_SPECIES)
-    if name_clean in old_cnn_species_set and name_clean not in stats_species_set:
-        return False
+    """Use model_stats_only_test_v2_PU by default for all species."""
     return True
 
 

@@ -791,6 +791,7 @@ async function generateFullmap() {
     // Poll /fullmap_progress — updates progress bar and redraws tiles as rows arrive
     showProgress(0, 'Computing full map…');
     setActiveDotRunning(true);
+    let lastFullmapRedraw = 0;
 
     const pollId = setInterval(async () => {
       try {
@@ -802,8 +803,12 @@ async function generateFullmap() {
         showProgress(pct, `Full map: ${p.done ?? 0}/${p.total ?? FULLMAP_GRID_N} rows · ${pct}%`);
         label.textContent = `${Math.round(pct)}%`;
 
-        // Redraw tiles so new rows appear immediately
-        if (sdmLayer) sdmLayer.redraw();
+        // Redraw tiles periodically so new cell calculations render
+        const now = Date.now();
+        if (now - lastFullmapRedraw > 4000) {
+          lastFullmapRedraw = now;
+          if (sdmLayer) sdmLayer.redraw();
+        }
 
         if (p.status === 'done') {
           clearInterval(pollId);

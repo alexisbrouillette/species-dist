@@ -8,6 +8,15 @@ from pathlib import Path
 numcodecs.blosc.use_threads = False
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
+def _resolve_asset_path(default_rel_path):
+    p = Path(default_rel_path)
+    if p.exists():
+        return p
+    alt = Path("data") / p.name
+    if alt.exists():
+        return alt
+    return p
+
 CACHE_DIR = Path("tile_cache_v2")
 if not CACHE_DIR.exists():
     CACHE_DIR.mkdir(exist_ok=True)
@@ -20,10 +29,13 @@ SPECIES_EMBEDDINGS_NPY  = Path("data/web_portal_assets/species_embeddings.npy")
 CHECKPOINT_PATH         = Path("model/model_simplified_v2_inference.pt")
 DYNAMIC_EMBEDDINGS_PATH = Path("dynamic_embeddings.pt")
 
-# Stats-only insect model configuration
+# Stats-only model configuration
 STATS_MODEL_PATH         = Path("data/model_stats_only_test_v2_PU.pt")
 STATS_INDEX_PATH         = Path("data/quebec_stats_index_1km.npy")
-STATS_SPECIES_EMBEDDINGS = Path("../notebooks/species_embeddings_v4_insects.csv")
+STATS_SPECIES_INSECTS    = _resolve_asset_path("data/web_portal_assets/species_embeddings_v4_insects.csv")
+STATS_SPECIES_BIRDS      = _resolve_asset_path("data/web_portal_assets/species_embeddings_v4_birds.csv")
+STATS_SPECIES_TREES      = _resolve_asset_path("data/web_portal_assets/species_embeddings_v4.csv")
+STATS_SPECIES_EMBEDDINGS = STATS_SPECIES_INSECTS
 STATS_LONS_PATH          = Path("data/stats_longitudes.npy")
 STATS_LATS_PATH          = Path("data/stats_latitudes.npy")
 WATER_FULL_EXTENT_PATH   = Path("data/water_full_extent.tif")
@@ -122,40 +134,76 @@ COLOR_STOPS = [
 DISCRETE_COLORS = _build_continuous_palette(COLOR_STOPS, n_levels=10)
 RAW_CONTINUOUS_COLORS = _build_continuous_palette(COLOR_STOPS, n_levels=256)
 
+def compute_scale_from_disk(species_name):
+    species_slug = species_name.lower().replace(" ", "_")
+    files = list(CACHE_DIR.glob(f"*_{species_slug}_*.npy"))
+    if not files:
+        return {'min_prob': 0.0, 'max_prob': 1.0, '_algo_version': 12}
+    all_probs = []
+    for f in files:
+        try:
+            arr = np.load(f)
+            valid = arr[~np.isnan(arr)]
+            if len(valid) > 0:
+                all_probs.append(valid)
+        except Exception:
+            pass
+    if not all_probs:
+        return {'min_prob': 0.0, 'max_prob': 1.0, '_algo_version': 12}
+    concat = np.concatenate(all_probs)
+    p_min = float(np.percentile(concat, 2))
+    p_max = float(np.percentile(concat, 98))
+    if p_max <= p_min:
+        p_min, p_max = float(concat.min()), float(concat.max())
+    if p_max <= p_min:
+        p_min, p_max = 0.0, 1.0
+    return {'min_prob': p_min, 'max_prob': p_max, '_algo_version': 12}
+
+_scale_cache = {}
+_scale_cache_lock = threading.Lock()
+
 # ── Viewport PNG Tile Cache ───────────────────────────────────────────────────
 class TilePngCache:
     def __init__(self, maxsize=1024):
-        from collections import OrderedDict
-        self.cache   = OrderedDict()
         self.maxsize = maxsize
-        self.lock    = threading.Lock()
+        self.cache = {}
+        self.lock = threading.Lock()
 
     def get(self, key):
         with self.lock:
-            if key in self.cache:
-                self.cache.move_to_end(key)
-                return self.cache[key]
-            return None
+            return self.cache.get(key)
 
-    def set(self, key, value):
+    def put(self, key, val):
         with self.lock:
-            self.cache[key] = value
-            self.cache.move_to_end(key)
-            if len(self.cache) > self.maxsize:
-                self.cache.popitem(last=False)
+            if len(self.cache) >= self.maxsize:
+                to_del = list(self.cache.keys())[:self.maxsize // 2]
+                for k in to_del:
+                    self.cache.pop(k, None)
+            self.cache[key] = val
 
-    def invalidate_species(self, species: str):
+    def set(self, key, val):
+        self.put(key, val)
+
+    def clear(self):
         with self.lock:
-            to_del = [k for k in self.cache.keys() if isinstance(k, tuple) and len(k) > 0 and str(k[0]).lower() == species.lower()]
+            self.cache.clear()
+
+    def clear_species(self, species):
+        with self.lock:
+            slug = species.lower().replace(" ", "_")
+            to_del = [k for k in self.cache if slug in k]
             for k in to_del:
                 self.cache.pop(k, None)
+
+    def invalidate_species(self, species):
+        self.clear_species(species)
 
 _tile_png_cache = TilePngCache()
 
 # ── Hugging Face Dataset Download Fallback ────────────────────────────────────
 def _download_hf_assets():
     import os
-    # Check if we are running in Hugging Face or if assets are missing
+    import traceback
     checkpoint_exists = CHECKPOINT_PATH.exists()
     
     needed_emb_files = [
@@ -175,20 +223,40 @@ def _download_hf_assets():
     
     mask_dir = Path("../data/data_layers/predictors_100_QC_normalized")
     
-    missing_emb = [f for f in needed_emb_files if not (EMB_DIR / f).exists()]
-    missing_mask = [f for f in needed_mask_files if not (mask_dir / f).exists()]
+    needed_data_files = [
+        ("water_full_extent.tif", Path("data")),
+        ("stats_longitudes.npy", Path("data")),
+        ("stats_latitudes.npy", Path("data")),
+        ("grid_coords_32198.npy", Path("data")),
+        ("quebec_stats_index_1km.npy", Path("data")),
+        ("model_stats_only_test_v2_PU.pt", Path("data")),
+        ("species_names.json", Path("data/web_portal_assets")),
+        ("species_embeddings.npy", Path("data/web_portal_assets")),
+        ("species_embeddings_v4.csv", Path("data/web_portal_assets")),
+        ("species_embeddings_v4_birds.csv", Path("data/web_portal_assets")),
+        ("species_embeddings_v4_insects.csv", Path("data/web_portal_assets")),
+    ]
 
-    if not checkpoint_exists or missing_emb or missing_mask:
+    missing_emb = [f for f in needed_emb_files if not (EMB_DIR / f).exists()]
+    missing_mask = [f for f in needed_mask_files if not (mask_dir / f).exists() and not (Path("data") / f).exists()]
+    missing_data = [
+        (fname, target_dir) for fname, target_dir in needed_data_files
+        if not (target_dir / fname).exists()
+    ]
+
+    if not checkpoint_exists or missing_emb or missing_mask or missing_data:
         dataset_repo = os.environ.get("DATASET_REPO", "alexisBb/sdm-explorer-data")
         print(f"📦 Hugging Face Space startup: Missing large assets locally.", flush=True)
         print(f"📂 Checking/Downloading from HF Dataset repository: '{dataset_repo}'...", flush=True)
         try:
             from huggingface_hub import hf_hub_download
             
-            # Ensure folders exist
+            # Ensure folders exist (resolve to absolute paths)
             CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
             EMB_DIR.mkdir(parents=True, exist_ok=True)
             mask_dir.mkdir(parents=True, exist_ok=True)
+            Path("data").mkdir(parents=True, exist_ok=True)
+            Path("data/web_portal_assets").mkdir(parents=True, exist_ok=True)
             
             # Download model weights if missing
             if not checkpoint_exists:
@@ -197,7 +265,7 @@ def _download_hf_assets():
                     repo_id=dataset_repo,
                     filename="model_simplified_v2_inference.pt",
                     repo_type="dataset",
-                    local_dir=str(CHECKPOINT_PATH.parent),
+                    local_dir=str(CHECKPOINT_PATH.parent.resolve()),
                     token=os.environ.get("HF_TOKEN")
                 )
             
@@ -208,9 +276,19 @@ def _download_hf_assets():
                     repo_id=dataset_repo,
                     filename=filename,
                     repo_type="dataset",
-                    local_dir=str(EMB_DIR),
+                    local_dir=str(EMB_DIR.resolve()),
                     token=os.environ.get("HF_TOKEN")
                 )
+
+            # Auto-extract context_map.zip if context_map.zarr directory does not exist
+            zip_path = EMB_DIR / "context_map.zip"
+            zarr_path = EMB_DIR / "context_map.zarr"
+            if zip_path.exists() and not zarr_path.exists():
+                print("📦 Auto-extracting context_map.zip to context_map.zarr...", flush=True)
+                import zipfile
+                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                    zip_ref.extractall(EMB_DIR.resolve())
+                print("✅ Extracted context_map.zarr successfully!", flush=True)
                 
             # Download mask TIFFs if missing
             for filename in missing_mask:
@@ -219,7 +297,18 @@ def _download_hf_assets():
                     repo_id=dataset_repo,
                     filename=filename,
                     repo_type="dataset",
-                    local_dir=str(mask_dir),
+                    local_dir=str(mask_dir.resolve()),
+                    token=os.environ.get("HF_TOKEN")
+                )
+
+            # Download stats model data files if missing
+            for filename, target_dir in missing_data:
+                print(f"  Downloading {filename} -> {target_dir}...", flush=True)
+                hf_hub_download(
+                    repo_id=dataset_repo,
+                    filename=filename,
+                    repo_type="dataset",
+                    local_dir=str(target_dir.resolve()),
                     token=os.environ.get("HF_TOKEN")
                 )
             print("✅ All Hugging Face Hub assets are downloaded and ready!", flush=True)
